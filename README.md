@@ -1,2 +1,3 @@
 # minimal-mqtt
-Minimal MQTT Library
+
+Minimal(in terms of memory usage) MQTT Library
