@@ -769,7 +769,7 @@ mmqtt_s_decode_connack_header(struct mmqtt_connection *conn, mmqtt_s_pusher push
   status = mmqtt_s_decode_buffer(conn, pusher, &header->reserved, 1, 1);
   if (status != MMQTT_STATUS_OK) { return status; }
 
-  return mmqtt_s_decode_buffer(conn, pusher, &header->reserved, 1, 1);
+  return mmqtt_s_decode_buffer(conn, pusher, &header->return_code, 1, 1);
 }
 
 /* Works for both subscribe and unsubscribe */
