@@ -16,6 +16,8 @@ typedef int8_t mmqtt_status_t;
 #define MMQTT_STATUS_NOT_PULLABLE -3
 #define MMQTT_STATUS_NOT_PUSHABLE -4
 #define MMQTT_STATUS_NOT_EXPECTED -5
+#define MMQTT_STATUS_BROKEN_CONNECTION -6
+#define MMQTT_STATUS_INVALID_STATE -7
 
 struct mmqtt_ring_buffer_ {
   mmqtt_ssize_t start;
@@ -33,6 +35,9 @@ struct mmqtt_queue_ {
   struct mmqtt_ring_buffer_ ring_buffer;
   struct mmqtt_stream* streams[MMQTT_QUEUE_MAX_LENGTH];
 };
+
+#define MMQTT_QUEUE_LENGTH(queue) ((queue)->ring_buffer.length)
+#define MMQTT_QUEUE_INDEX(queue, i) ((queue)->streams[((queue)->ring_buffer.start + (i)) % ((queue)->ring_buffer.capacity)])
 
 struct mmqtt_connection {
   void *connection;
@@ -86,7 +91,7 @@ mmqtt_stream_init(struct mmqtt_stream *stream, size_t total_size)
 static mmqtt_status_t
 mmqtt_stream_running(struct mmqtt_stream *stream)
 {
-  if (stream->left > 0) {
+  if (stream->left > 0 || stream->ring_buffer.length > 0) {
     return MMQTT_STATUS_OK;
   } else {
     return MMQTT_STATUS_DONE;
@@ -116,6 +121,39 @@ mmqtt_stream_pull(struct mmqtt_stream *stream, uint8_t* out, mmqtt_ssize_t max_l
   return pullable;
 }
 
+static mmqtt_status_t
+mmqtt_stream_external_pullable(struct mmqtt_stream *stream,
+                               const uint8_t** data, mmqtt_ssize_t* max_length)
+{
+  mmqtt_ssize_t pullable;
+  pullable = mmqtt_ring_buffer_pullable_(&stream->ring_buffer);
+  if (pullable <= 0) {
+    if (stream->left == 0) {
+      return MMQTT_STATUS_DONE;
+    } else {
+      return MMQTT_STATUS_NOT_PULLABLE;
+    }
+  }
+  pullable = mmqtt_ring_buffer_pullable_(&stream->ring_buffer);
+  if (pullable <= 0) { return MMQTT_STATUS_NOT_PULLABLE; }
+  *data = stream->data + stream->ring_buffer.start;
+  *max_length = pullable;
+  return MMQTT_STATUS_OK;
+}
+
+static mmqtt_status_t
+mmqtt_stream_external_pull(struct mmqtt_stream *stream, mmqtt_ssize_t length)
+{
+  mmqtt_ssize_t pullable;
+  pullable = mmqtt_ring_buffer_pullable_(&stream->ring_buffer);
+  if (pullable < length) {
+    return MMQTT_STATUS_NOT_PULLABLE;
+  } else {
+    mmqtt_ring_buffer_pull_(&stream->ring_buffer, length);
+    return MMQTT_STATUS_OK;
+  }
+}
+
 static mmqtt_ssize_t
 mmqtt_stream_push(struct mmqtt_stream *stream, const uint8_t* in, mmqtt_ssize_t length)
 {
@@ -133,6 +171,36 @@ mmqtt_stream_push(struct mmqtt_stream *stream, const uint8_t* in, mmqtt_ssize_t 
   return pushable;
 }
 
+static mmqtt_status_t
+mmqtt_stream_external_pushable(struct mmqtt_stream *stream,
+                               uint8_t** data, mmqtt_ssize_t* max_length)
+{
+  mmqtt_ssize_t pushable;
+  if (stream->left == 0) { return MMQTT_STATUS_DONE; }
+  pushable = mmqtt_ring_buffer_pushable_(&stream->ring_buffer);
+  if (pushable <= 0) { return MMQTT_STATUS_NOT_PUSHABLE; }
+  pushable = min(pushable, stream->left);
+  *data = stream->data + stream->ring_buffer.start;
+  *max_length = pushable;
+  return MMQTT_STATUS_OK;
+}
+
+static mmqtt_status_t
+mmqtt_stream_external_push(struct mmqtt_stream *stream, mmqtt_ssize_t length)
+{
+  mmqtt_ssize_t pushable;
+  if (stream->left == 0) { return MMQTT_STATUS_DONE; }
+  pushable = mmqtt_ring_buffer_pushable_(&stream->ring_buffer);
+  if (pushable <= 0) { return MMQTT_STATUS_NOT_PUSHABLE; }
+  pushable = min(pushable, stream->left);
+  if (pushable < length) {
+    return MMQTT_STATUS_NOT_PUSHABLE;
+  } else {
+    mmqtt_ring_buffer_push_(&stream->ring_buffer, pushable);
+    return MMQTT_STATUS_OK;
+  }
+}
+
 static void
 mmqtt_queue_init_(struct mmqtt_queue_ *queue)
 {
@@ -146,7 +214,7 @@ mmqtt_queue_add_(struct mmqtt_queue_ *queue, struct mmqtt_stream *stream)
     return MMQTT_STATUS_NOT_PUSHABLE;
   }
   queue->streams[queue->ring_buffer.start] = stream;
-  mmqtt_ring_buffer_push_(&stream->ring_buffer, 1);
+  mmqtt_ring_buffer_push_(&queue->ring_buffer, 1);
   return MMQTT_STATUS_OK;
 }
 
@@ -192,8 +260,18 @@ mmqtt_connection_pull(struct mmqtt_connection *connection,
   return (length > 0) ? length : MMQTT_STATUS_NOT_PULLABLE;
 }
 
-#define MMQTT_QUEUE_LENGTH(queue) ((queue)->ring_buffer.length)
-#define MMQTT_QUEUE_INDEX(queue, i) ((queue)->streams[((queue)->ring_buffer.start + (i)) % ((queue)->ring_buffer.capacity)])
+struct mmqtt_stream *
+mmqtt_connection_pullable_stream(struct mmqtt_connection *connection)
+{
+  mmqtt_ssize_t i;
+  struct mmqtt_queue_ *queue = &connection->write_queue;
+  struct mmqtt_stream *stream = NULL;
+  for (i = 0; i < MMQTT_QUEUE_LENGTH(queue); i++) {
+    stream = MMQTT_QUEUE_INDEX(queue, i);
+    if (mmqtt_stream_running(stream) == MMQTT_STATUS_OK) { return stream; }
+  }
+  return NULL;
+}
 
 /*
  * Pushes data to connection's read queue, the data should come from
@@ -224,6 +302,19 @@ mmqtt_connection_push(struct mmqtt_connection *connection,
   return (consumed_length > 0) ? consumed_length : MMQTT_STATUS_NOT_PUSHABLE;
 }
 
+struct mmqtt_stream *
+mmqtt_connection_pushable_stream(struct mmqtt_connection *connection)
+{
+  mmqtt_ssize_t i;
+  struct mmqtt_queue_ *queue = &connection->read_queue;
+  struct mmqtt_stream *stream = NULL;
+  for (i = 0; i < MMQTT_QUEUE_LENGTH(queue); i++) {
+    stream = MMQTT_QUEUE_INDEX(queue, i);
+    if (mmqtt_stream_running(stream) == MMQTT_STATUS_OK) { return stream; }
+  }
+  return NULL;
+}
+
 static mmqtt_status_t
 mmqtt_connection_add_read_stream(struct mmqtt_connection *connection,
                                  struct mmqtt_stream *stream)
@@ -238,12 +329,56 @@ mmqtt_connection_add_write_stream(struct mmqtt_connection *connection,
   return mmqtt_queue_add_(&connection->write_queue, stream);
 }
 
-/*
- * There's no need to release a write stream, connection would detect
- * a stream is done, and release it while pulling data.
- * Read stream, on the other hand, is pulled by user manually, so connection
- * knows nothing about when it is done.
- */
+static mmqtt_status_t
+mmqtt_connection_in_read_stream(struct mmqtt_connection *connection,
+                                struct mmqtt_stream *stream)
+{
+  mmqtt_ssize_t i;
+  struct mmqtt_queue_ *queue = &connection->read_queue;
+  for (i = 0; i < MMQTT_QUEUE_LENGTH(queue); i++) {
+    if (MMQTT_QUEUE_INDEX(queue, i) == stream) { return MMQTT_STATUS_OK; }
+  }
+  return MMQTT_STATUS_NOT_EXPECTED;
+}
+
+static mmqtt_status_t
+mmqtt_connection_in_write_stream(struct mmqtt_connection *connection,
+                                 struct mmqtt_stream *stream)
+{
+  mmqtt_ssize_t i;
+  struct mmqtt_queue_ *queue = &connection->write_queue;
+  for (i = 0; i < MMQTT_QUEUE_LENGTH(queue); i++) {
+    if (MMQTT_QUEUE_INDEX(queue, i) == stream) { return MMQTT_STATUS_OK; }
+  }
+  return MMQTT_STATUS_NOT_EXPECTED;
+}
+
+static mmqtt_ssize_t
+mmqtt_connection_read_stream_length(struct mmqtt_connection *connection)
+{
+  return connection->read_queue.ring_buffer.length;
+}
+
+static mmqtt_ssize_t
+mmqtt_connection_write_stream_length(struct mmqtt_connection *connection)
+{
+  return connection->write_queue.ring_buffer.length;
+}
+
+static mmqtt_status_t
+mmqtt_connection_release_write_stream(struct mmqtt_connection *connection,
+                                      struct mmqtt_stream *stream)
+{
+  if (!MMQTT_QUEUE_AVAILABLE(&connection->write_queue)) {
+    return MMQTT_STATUS_NOT_PULLABLE;
+  }
+  if (stream != MMQTT_QUEUE_FIRST(&connection->write_queue)) {
+    return MMQTT_STATUS_NOT_EXPECTED;
+  }
+  mmqtt_ring_buffer_pull_(&connection->write_queue.ring_buffer, 1);
+  return MMQTT_STATUS_OK;
+}
+
 static mmqtt_status_t
 mmqtt_connection_release_read_stream(struct mmqtt_connection *connection,
                                      struct mmqtt_stream *stream)
@@ -255,6 +390,21 @@ mmqtt_connection_release_read_stream(struct mmqtt_connection *connection,
     return MMQTT_STATUS_NOT_EXPECTED;
   }
   mmqtt_ring_buffer_pull_(&connection->read_queue.ring_buffer, 1);
+  return MMQTT_STATUS_OK;
+}
+
+static mmqtt_status_t
+mmqtt_connection_autorelease_write_streams(struct mmqtt_connection *connection)
+{
+  struct mmqtt_stream *stream;
+  while (MMQTT_QUEUE_AVAILABLE(&connection->write_queue)) {
+    stream = MMQTT_QUEUE_FIRST(&connection->write_queue);
+    if (mmqtt_stream_running(stream) == MMQTT_STATUS_DONE) {
+      mmqtt_connection_release_write_stream(connection, stream);
+    } else {
+      break;
+    }
+  }
   return MMQTT_STATUS_OK;
 }
 

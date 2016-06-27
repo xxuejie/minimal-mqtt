@@ -4,7 +4,22 @@
 #include "minimal-mqtt.h"
 
 typedef mmqtt_status_t (*mmqtt_s_puller)(struct mmqtt_connection*);
-typedef mmqtt_status_t (*mmqtt_s_pusher)(struct mmqtt_connection*);
+typedef mmqtt_status_t (*mmqtt_s_pusher)(struct mmqtt_connection*, mmqtt_ssize_t);
+
+#define MMQTT_MESSAGE_TYPE_CONNECT 0x1
+#define MMQTT_MESSAGE_TYPE_CONNACK 0x2
+#define MMQTT_MESSAGE_TYPE_PUBLISH 0x3
+#define MMQTT_MESSAGE_TYPE_PUBACK 0x4
+#define MMQTT_MESSAGE_TYPE_SUBSCRIBE 0x8
+#define MMQTT_MESSAGE_TYPE_SUBACK 0x9
+#define MMQTT_MESSAGE_TYPE_UNSUBSCRIBE 0x10
+#define MMQTT_MESSAGE_TYPE_UNSUBACK 0x11
+#define MMQTT_MESSAGE_TYPE_PINGREQ 0x12
+#define MMQTT_MESSAGE_TYPE_PINGRESP 0x13
+#define MMQTT_MESSAGE_TYPE_DISCONNECT 0x14
+
+#define MMQTT_PACK_MESSAGE_TYPE(type_) ((type_) << 4)
+#define MMQTT_UNPACK_MESSAGE_TYPE(type_) (((type_) >> 4) & 0xF)
 
 mmqtt_status_t
 mmqtt_s_encode_buffer(struct mmqtt_connection *conn, mmqtt_s_puller puller,
@@ -33,6 +48,10 @@ mmqtt_s_encode_buffer(struct mmqtt_connection *conn, mmqtt_s_puller puller,
       if (status != MMQTT_STATUS_OK) { return status; }
     }
   }
+  while (mmqtt_connection_in_write_stream(conn, &stream) == MMQTT_STATUS_OK) {
+    status = puller(conn);
+    if (status != MMQTT_STATUS_OK) { return status; }
+  }
   return MMQTT_STATUS_OK;
 }
 
@@ -47,6 +66,10 @@ mmqtt_s_decode_buffer(struct mmqtt_connection *conn, mmqtt_s_pusher pusher,
   uint16_t length;
   uint8_t temp;
 
+  if (mmqtt_connection_read_stream_length(conn) > 0) {
+    return MMQTT_STATUS_INVALID_STATE;
+  }
+
   if (consume_length < buffer_length) { consume_length = buffer_length; }
   mmqtt_stream_init(&stream, consume_length);
   /* Connection won't remove read stream automatically, pusher won't help here */
@@ -60,8 +83,11 @@ mmqtt_s_decode_buffer(struct mmqtt_connection *conn, mmqtt_s_pusher pusher,
     if (current >= 0) {
       length += current;
     } else if (current == MMQTT_STATUS_NOT_PULLABLE) {
-      status = pusher(conn);
-      if (status != MMQTT_STATUS_OK) { return status; }
+      status = pusher(conn, buffer_length - length);
+      if (status != MMQTT_STATUS_OK) {
+        mmqtt_connection_release_read_stream(conn, &stream);
+        return status;
+      }
     }
   }
   while (length < consume_length) {
@@ -69,11 +95,39 @@ mmqtt_s_decode_buffer(struct mmqtt_connection *conn, mmqtt_s_pusher pusher,
     if (current >= 0) {
       length += current;
     } else if (current == MMQTT_STATUS_NOT_PULLABLE) {
-      status = pusher(conn);
-      if (status != MMQTT_STATUS_OK) { return status; }
+      status = pusher(conn, consume_length - length);
+      if (status != MMQTT_STATUS_OK) {
+        mmqtt_connection_release_read_stream(conn, &stream);
+        return status;
+      }
     }
   }
+  mmqtt_connection_release_read_stream(conn, &stream);
   return MMQTT_STATUS_OK;
+}
+
+/* NOTE: for smaller buffer, we can also use mmqtt_s_decode_buffer with
+ * an empty buffer and 0 as buffer length. Here this function is for the
+ * case where we are skipping a whole packet altogether, which could be
+ * larger than 65535 in theory.
+ */
+mmqtt_status_t
+mmqtt_s_skip_buffer(struct mmqtt_connection *conn, mmqtt_s_pusher pusher,
+                    uint32_t length)
+{
+  mmqtt_status_t status;
+  while (length > 65535) {
+    status = mmqtt_s_decode_buffer(conn, pusher, NULL, 0, 65535);
+    if (status != MMQTT_STATUS_OK) {
+      return status;
+    }
+    length -= 65535;
+  }
+  if (length > 0) {
+    return mmqtt_s_decode_buffer(conn, pusher, NULL, 0, (uint16_t) length);
+  } else {
+    return MMQTT_STATUS_OK;
+  }
 }
 
 mmqtt_status_t
@@ -132,7 +186,7 @@ void mmqtt_s_pack_uint16_(uint16_t length, uint8_t *buffer)
 
 uint16_t mmqtt_s_unpack_uint16_(uint8_t *buffer)
 {
-  return ((uint16_t) (buffer[1] << 8)) | ((uint16_t) buffer[0]);
+  return ((uint16_t) (buffer[0] << 8)) | ((uint16_t) buffer[1]);
 }
 
 /* We don't case uint16_t* directly into uint8_t* because there might be
@@ -193,7 +247,7 @@ mmqtt_s_decode_string(struct mmqtt_connection *conn, mmqtt_s_pusher pusher,
   if (status != MMQTT_STATUS_OK) { return status; }
 
   if (out_length) { *out_length = length; }
-  if (out_true_length) { *out_true_length = length; }
+  if (out_true_length) { *out_true_length = true_length; }
   return MMQTT_STATUS_OK;
 }
 
@@ -344,6 +398,18 @@ mmqtt_s_decode_subscribe_payload(struct mmqtt_connection *conn, mmqtt_s_pusher p
     line->qos = 0;
   }
   return MMQTT_STATUS_OK;
+}
+
+uint32_t
+mmqtt_s_string_encoded_length(uint16_t string_length)
+{
+  return string_length + 2;
+}
+
+uint32_t
+mmqtt_s_connect_header_encoded_length(const struct mmqtt_p_connect_header *header)
+{
+  return mmqtt_s_string_encoded_length(header->name_length) + 4;
 }
 
 #endif  /* MMQTT_STATIC_H_ */
