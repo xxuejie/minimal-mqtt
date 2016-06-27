@@ -1,6 +1,11 @@
 #ifndef MMQTT_H_
 #define MMQTT_H_
 
+#include <stdint.h>
+#ifndef min
+#define min(a, b) ((a) > (b) ? (b) : (a))
+#endif  /* min */
+
 #define MMQTT_STREAM_MAX_LENGTH 8
 #define MMQTT_QUEUE_MAX_LENGTH 2
 
